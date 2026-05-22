@@ -21,7 +21,8 @@ from rich.progress import (
 
 from scanner import (
     DEFAULT_PORTS,
-    DEFAULT_TIMEOUT,
+    DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_READ_TIMEOUT,
     ScanTarget,
     ScanResult,
     auto_concurrency,
@@ -126,7 +127,8 @@ def _detect_format(path: str, fmt: str | None) -> str:
 async def run_scan(
     targets: list[ScanTarget],
     concurrency: int | None,
-    timeout: float,
+    connect_timeout: float,
+    read_timeout: float,
     json_output: bool,
     output_file: str | None = None,
     output_format: str | None = None,
@@ -160,7 +162,10 @@ async def run_scan(
     ) as progress:
         task_id = progress.add_task("[cyan]Scanning...", total=total)
 
-        async for result in scan(targets, concurrency=concurrency, timeout=timeout):
+        async for result in scan(
+            targets, concurrency=concurrency,
+            connect_timeout=connect_timeout, read_timeout=read_timeout,
+        ):
             all_results.append(result)
             found += len(result.services)
             progress.update(task_id, advance=1, description=f"[cyan]Scanned {progress.tasks[0].completed}/{total} targets, {found} services found")
@@ -206,9 +211,14 @@ def main() -> None:
         help="Max concurrent requests (default: auto-calculated from CPU cores and file-descriptor limit)",
     )
     parser.add_argument(
-        "-t", "--timeout",
-        type=float, default=DEFAULT_TIMEOUT,
-        help=f"Request timeout in seconds (default: {DEFAULT_TIMEOUT})",
+        "--connect-timeout",
+        type=float, default=DEFAULT_CONNECT_TIMEOUT,
+        help=f"TCP connect timeout in seconds (default: {DEFAULT_CONNECT_TIMEOUT})",
+    )
+    parser.add_argument(
+        "-t", "--read-timeout",
+        type=float, default=DEFAULT_READ_TIMEOUT,
+        help=f"Response read timeout in seconds (default: {DEFAULT_READ_TIMEOUT})",
     )
     parser.add_argument(
         "--json", dest="json_output", action="store_true",
@@ -256,7 +266,8 @@ def main() -> None:
     console.print(f"[dim]Concurrency:[/] {concurrency} (CPU cores: {os.cpu_count() or '?'})\n")
 
     asyncio.run(run_scan(
-        targets, concurrency, args.timeout, args.json_output,
+        targets, concurrency, args.connect_timeout, args.read_timeout,
+        args.json_output,
         output_file=args.output, output_format=args.output_format,
     ))
 

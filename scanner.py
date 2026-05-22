@@ -26,9 +26,19 @@ DEFAULT_PORTS = [
     10443,
 ]
 
-DEFAULT_TIMEOUT = 5.0
+DEFAULT_CONNECT_TIMEOUT = 2.0
+DEFAULT_READ_TIMEOUT = 3.0
 MIN_CONCURRENCY = 50
 MAX_CONCURRENCY = 1000
+MAX_RESPONSE_READ = 64 * 1024
+
+URL_PATTERN = re.compile(
+    r"^(?:https?://)?"                    # optional scheme
+    r"((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)*"
+    r"[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)"  # hostname
+    r"(:\d{1,5})?"                        # optional port
+    r"(/.*)?$"                            # optional path
+)
 
 
 def auto_concurrency() -> int:
@@ -40,14 +50,6 @@ def auto_concurrency() -> int:
     by_fds = max(MIN_CONCURRENCY, (soft - 128) // 2)
     by_cpu = cpu * 30
     return max(MIN_CONCURRENCY, min(by_cpu, by_fds, MAX_CONCURRENCY))
-MAX_RESPONSE_READ = 64 * 1024
-URL_PATTERN = re.compile(
-    r"^(?:https?://)?"                    # optional scheme
-    r"((?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)*"
-    r"[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)"  # hostname
-    r"(:\d{1,5})?"                        # optional port
-    r"(/.*)?$"                            # optional path
-)
 
 
 @dataclass(slots=True)
@@ -106,7 +108,7 @@ RETRYABLE = (
 async def _attempt(
     client: httpx.AsyncClient,
     url: str,
-    timeout: float,
+    timeout: httpx.Timeout,
 ) -> WebService | None:
     try:
         resp = await client.get(
@@ -154,7 +156,7 @@ async def _probe(
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
     url: str,
-    timeout: float,
+    timeout: httpx.Timeout,
 ) -> WebService | None:
     async with sem:
         for attempt in range(2):
@@ -173,29 +175,57 @@ async def scan_target(
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
     target: ScanTarget,
-    timeout: float,
+    timeout: httpx.Timeout,
+    concurrency: int,
 ) -> ScanResult:
-    tasks: list[asyncio.Task[WebService | None]] = []
+    urls: list[str] = []
     for port in target.ports:
         for scheme in ("https", "http"):
-            url = f"{scheme}://{target.host}:{port}"
-            tasks.append(asyncio.create_task(
-                _probe(client, sem, url, timeout),
-                name=url,
-            ))
+            urls.append(f"{scheme}://{target.host}:{port}")
 
-    results = await asyncio.gather(*tasks)
-    services = [s for s in results if s is not None]
+    total = len(urls)
+    worker_count = min(concurrency, total)
+    queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=worker_count * 4)
+    services: list[WebService] = []
+
+    async def worker() -> None:
+        while True:
+            url = await queue.get()
+            if url is None:
+                queue.task_done()
+                return
+            result = await _probe(client, sem, url, timeout)
+            queue.task_done()
+            if result is not None:
+                services.append(result)
+
+    workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+
+    for url in urls:
+        await queue.put(url)
+    for _ in range(worker_count):
+        await queue.put(None)
+
+    await asyncio.gather(*workers)
     return ScanResult(target=target.host, services=services)
 
 
 async def scan(
     targets: list[ScanTarget],
     concurrency: int | None = None,
-    timeout: float = DEFAULT_TIMEOUT,
+    connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
+    read_timeout: float = DEFAULT_READ_TIMEOUT,
 ) -> AsyncIterator[ScanResult]:
     if concurrency is None:
         concurrency = auto_concurrency()
+
+    timeout = httpx.Timeout(
+        connect=connect_timeout,
+        read=read_timeout,
+        write=1.0,
+        pool=1.0,
+    )
+
     limits = httpx.Limits(
         max_connections=concurrency,
         max_keepalive_connections=min(concurrency, 50),
@@ -210,7 +240,10 @@ async def scan(
         headers={"User-Agent": "WebPulse/1.0"},
     ) as client:
         sem = asyncio.Semaphore(concurrency)
-        coros = [scan_target(client, sem, t, timeout) for t in targets]
+        coros = [
+            scan_target(client, sem, t, timeout, concurrency)
+            for t in targets
+        ]
         for coro in asyncio.as_completed(coros):
             result = await coro
             yield result
