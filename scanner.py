@@ -96,52 +96,81 @@ def _extract_title(body: str) -> str:
     return ""
 
 
+RETRYABLE = (
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.PoolTimeout,
+    httpx.RemoteProtocolError,
+)
+
+
+async def _attempt(
+    client: httpx.AsyncClient,
+    url: str,
+    timeout: float,
+) -> WebService | None:
+    try:
+        resp = await client.get(
+            url,
+            timeout=timeout,
+            follow_redirects=True,
+        )
+    except RETRYABLE:
+        raise
+    except httpx.HTTPStatusError as e:
+        resp = e.response
+    except (httpx.ConnectError, ssl.SSLError):
+        return None
+    except Exception:
+        return None
+
+    content_type = resp.headers.get("content-type", "")
+    server = resp.headers.get("server", "")
+    redirect_url = ""
+
+    title = ""
+    is_html = "html" in content_type or not content_type
+    if is_html and resp.content:
+        try:
+            raw = resp.content[:MAX_RESPONSE_READ].decode("utf-8", errors="replace")
+            title = _extract_title(raw)
+        except Exception:
+            pass
+
+    history = resp.history
+    if history:
+        redirect_url = str(history[0].url)
+
+    return WebService(
+        url=str(resp.url),
+        status_code=resp.status_code,
+        title=title,
+        server=server,
+        content_type=content_type,
+        redirect_url=redirect_url,
+    )
+
+
 async def _probe(
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
     url: str,
     timeout: float,
+    errors: list[str],
 ) -> WebService | None:
     async with sem:
-        try:
-            resp = await client.get(
-                url,
-                timeout=timeout,
-                follow_redirects=True,
-            )
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
-                httpx.RemoteProtocolError, httpx.PoolTimeout, ssl.SSLError):
-            return None
-        except httpx.HTTPStatusError:
-            return None
-        except Exception:
-            return None
-
-        content_type = resp.headers.get("content-type", "")
-        server = resp.headers.get("server", "")
-        redirect_url = ""
-
-        title = ""
-        is_html = "html" in content_type or not content_type
-        if is_html and resp.content:
+        for attempt in range(2):
             try:
-                raw = resp.content[:MAX_RESPONSE_READ].decode("utf-8", errors="replace")
-                title = _extract_title(raw)
+                return await _attempt(client, url, timeout)
+            except RETRYABLE:
+                if attempt == 1:
+                    errors.append(f"{url}: timeout/protocol error after 2 attempts")
+                    return None
+                await asyncio.sleep(0.5)
             except Exception:
-                pass
-
-        history = resp.history
-        if history:
-            redirect_url = str(history[0].url)
-
-        return WebService(
-            url=str(resp.url),
-            status_code=resp.status_code,
-            title=title,
-            server=server,
-            content_type=content_type,
-            redirect_url=redirect_url,
-        )
+                errors.append(f"{url}: unexpected error")
+                return None
+        return None
 
 
 async def scan_target(
@@ -150,18 +179,19 @@ async def scan_target(
     target: ScanTarget,
     timeout: float,
 ) -> ScanResult:
+    errors: list[str] = []
     tasks: list[asyncio.Task[WebService | None]] = []
     for port in target.ports:
         for scheme in ("https", "http"):
             url = f"{scheme}://{target.host}:{port}"
             tasks.append(asyncio.create_task(
-                _probe(client, sem, url, timeout),
+                _probe(client, sem, url, timeout, errors),
                 name=url,
             ))
 
     results = await asyncio.gather(*tasks)
     services = [s for s in results if s is not None]
-    return ScanResult(target=target.host, services=services)
+    return ScanResult(target=target.host, services=services, errors=errors)
 
 
 async def scan(

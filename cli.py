@@ -67,7 +67,7 @@ def display_result(result: ScanResult, table: Table) -> None:
         )
 
 
-def _flatten_results(results: list[ScanResult]) -> list[dict]:
+def _flatten_services(results: list[ScanResult]) -> list[dict]:
     rows = []
     for r in results:
         for s in r.services:
@@ -82,35 +82,52 @@ def _flatten_results(results: list[ScanResult]) -> list[dict]:
     return rows
 
 
+def _build_json_output(results: list[ScanResult]) -> dict:
+    all_errors: list[str] = []
+    for r in results:
+        all_errors.extend(r.errors)
+    return {
+        "services": _flatten_services(results),
+        "errors": all_errors,
+    }
+
+
 def _write_output(
     results: list[ScanResult],
     path: str,
     fmt: str,
 ) -> None:
-    rows = _flatten_results(results)
-    if not rows:
-        return
+    output = _build_json_output(results)
+    svc_rows = _flatten_services(results)
 
     if fmt == "json":
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(rows, f, ensure_ascii=False, indent=2)
+            json.dump(output, f, ensure_ascii=False, indent=2)
 
     elif fmt == "csv":
         with open(path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-            writer.writeheader()
-            writer.writerows(rows)
+            if svc_rows:
+                writer = csv.DictWriter(f, fieldnames=svc_rows[0].keys())
+                writer.writeheader()
+                writer.writerows(svc_rows)
 
     elif fmt == "txt":
         with open(path, "w", encoding="utf-8") as f:
-            for row in rows:
+            for row in svc_rows:
                 f.write(
                     f"{row['url']}  [{row['status_code']}]  "
                     f"title={row['title'] or '-'}  "
                     f"server={row['server'] or '-'}\n"
                 )
+            if output["errors"]:
+                f.write("\n--- Errors ---\n")
+                for err in output["errors"]:
+                    f.write(f"{err}\n")
 
-    console.print(f"[dim]Results written to[/] [bold]{path}[/] ({len(rows)} entries, {fmt})")
+    entry_count = f"{len(svc_rows)} services"
+    if output["errors"]:
+        entry_count += f", {len(output['errors'])} errors"
+    console.print(f"[dim]Results written to[/] [bold]{path}[/] ({entry_count}, {fmt})")
 
 
 def _detect_format(path: str, fmt: str | None) -> str:
@@ -148,6 +165,7 @@ async def run_scan(
 
     total = len(targets)
     found = 0
+    error_count = 0
     all_results: list[ScanResult] = []
 
     with Progress(
@@ -164,13 +182,13 @@ async def run_scan(
         async for result in scan(targets, concurrency=concurrency, timeout=timeout):
             all_results.append(result)
             found += len(result.services)
+            error_count += len(result.errors)
             progress.update(task_id, advance=1, description=f"[cyan]Scanned {progress.tasks[0].completed}/{total} targets, {found} services found")
 
     all_results.sort(key=lambda r: len(r.services), reverse=True)
 
     if json_output:
-        output = _flatten_results(all_results)
-        console.print_json(json.dumps(output, ensure_ascii=False, indent=2))
+        console.print_json(json.dumps(_build_json_output(all_results), ensure_ascii=False, indent=2))
     else:
         for r in all_results:
             display_result(r, table)
@@ -179,7 +197,17 @@ async def run_scan(
         else:
             console.print("[yellow]No web services found.[/]")
 
-    console.print(f"\n[bold green]Done.[/] Scanned {total} target(s), found {found} web service(s).")
+    summary = f"Scanned {total} target(s), found {found} web service(s)"
+    if error_count > 0:
+        summary += f", {error_count} probe error(s)"
+    console.print(f"\n[bold green]Done.[/] {summary}.")
+
+    if not json_output:
+        for r in all_results:
+            if r.errors:
+                console.print(f"\n[bold red]Errors for {r.target}:[/]")
+                for err in r.errors:
+                    console.print(f"  [dim]{err}[/]")
 
     if output_file:
         fmt = _detect_format(output_file, output_format)
