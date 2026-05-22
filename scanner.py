@@ -70,7 +70,6 @@ class ScanTarget:
 class ScanResult:
     target: str
     services: list[WebService] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
 
 
 def parse_target(raw: str, ports: list[int] | None = None) -> ScanTarget:
@@ -156,7 +155,6 @@ async def _probe(
     sem: asyncio.Semaphore,
     url: str,
     timeout: float,
-    errors: list[str],
 ) -> WebService | None:
     async with sem:
         for attempt in range(2):
@@ -164,11 +162,9 @@ async def _probe(
                 return await _attempt(client, url, timeout)
             except RETRYABLE:
                 if attempt == 1:
-                    errors.append(f"{url}: timeout/protocol error after 2 attempts")
                     return None
                 await asyncio.sleep(0.5)
             except Exception:
-                errors.append(f"{url}: unexpected error")
                 return None
         return None
 
@@ -179,19 +175,18 @@ async def scan_target(
     target: ScanTarget,
     timeout: float,
 ) -> ScanResult:
-    errors: list[str] = []
     tasks: list[asyncio.Task[WebService | None]] = []
     for port in target.ports:
         for scheme in ("https", "http"):
             url = f"{scheme}://{target.host}:{port}"
             tasks.append(asyncio.create_task(
-                _probe(client, sem, url, timeout, errors),
+                _probe(client, sem, url, timeout),
                 name=url,
             ))
 
     results = await asyncio.gather(*tasks)
     services = [s for s in results if s is not None]
-    return ScanResult(target=target.host, services=services, errors=errors)
+    return ScanResult(target=target.host, services=services)
 
 
 async def scan(
